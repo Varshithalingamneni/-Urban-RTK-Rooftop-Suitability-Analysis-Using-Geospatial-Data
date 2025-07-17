@@ -1,0 +1,249 @@
+Commands for DEAN 690
+---------------------------------------------------------------------------------------------
+CREATE INDEX idx_buildings_geom ON buildings_data USING GIST(wkb_geometry);
+ALTER TABLE buildings_data RENAME COLUMN wkb_geometry TO geom;
+---------------------------------------------------------------------------------------------
+CREATE TEMP TABLE building_avg AS
+SELECT b.id,
+       AVG(t.altitude) AS avg_elevation
+FROM buildings_data b
+JOIN terrain_data t ON ST_Intersects(b.geom, t.geom)
+GROUP BY b.id;
+---------------------------------------------------------------------------------------------
+UPDATE buildings_data b
+SET avg_elevation = a.avg_elevation
+FROM building_avg a
+WHERE b.id = a.id;
+---------------------------------------------------------------------------------------------
+ALTER TABLE buildings_data
+ADD COLUMN absolute_top numeric;
+---------------------------------------------------------------------------------------------
+UPDATE buildings_data
+SET absolute_top = avg_elevation + height
+WHERE avg_elevation IS NOT NULL AND height IS NOT NULL;
+---------------------------------------------------------------------------------------------
+ALTER TABLE buildings_data
+ADD COLUMN bldg_footprint_centroid geometry(Point, 3857);
+---------------------------------------------------------------------------------------------
+UPDATE buildings_data
+SET bldg_footprint_centroid = ST_Centroid(geom);
+--------------------------------------------------------------------------------------------
+CREATE TABLE rectangle_polygons (
+  id serial PRIMARY KEY,
+  name varchar(100),
+  geom geometry(Polygon, 4326)
+);
+--------------------------------------------------------------------------------------------
+INSERT INTO rectangle_polygons (name, geom)
+VALUES (	
+  'DC Area',
+  ST_GeomFromText(
+    'POLYGON((
+      -77.11976 38.79164,
+      -77.11976 38.99555,
+      -76.90939 38.99555,
+      -76.90939 38.79164,
+      -77.11976 38.79164
+    ))',
+    4326
+  )
+);
+-------------------------------------------------------------------------------------------
+INSERT INTO rectangle_polygons (name, geom)
+VALUES (
+  'GMU Fairfax Campus',
+  ST_GeomFromText(
+    'POLYGON((
+      -77.32283 38.81956,
+      -77.32283 38.84154,
+      -77.29229 38.84154,
+      -77.29229 38.81956,
+      -77.32283 38.81956
+    ))',
+    4326
+  )
+);
+--------------------------------------------------------------------------------------------
+CREATE INDEX idx_rectangle_polygons_geom
+ON rectangle_polygons
+USING GIST(geom);
+--------------------------------------------------------------------------------------------
+CREATE TABLE test_bldgs AS
+SELECT b.*
+FROM buildings_data b
+JOIN rectangle_polygons r 
+  ON r.name = 'GMU Fairfax Campus'
+WHERE ST_Intersects(b.geom, ST_Transform(r.geom, 3857));
+--------------------------------------------------------------------------------------------
+ALTER TABLE test_bldgs
+ADD COLUMN test_bldg_id SERIAL PRIMARY KEY;
+--------------------------------------------------------------------------------------------
+CREATE INDEX idx_test_bldgs_geom
+ON test_bldgs
+USING GIST(geom);
+--------------------------------------------------------------------------------------------
+CREATE TABLE test_bldgs_hprofile AS 
+SELECT 
+  b.id AS building_id,
+  deg AS horiz_azimuth_degree,
+  ST_MakeLine(
+    b.roof_center,
+    ST_SetSRID(
+      ST_Project(b.roof_center::geography, 30000, deg * pi()/180)::geometry,
+      4326
+    )
+  ) AS horiz_line
+FROM test_bldgs b
+CROSS JOIN generate_series(0,359) deg;
+-------------------------------------------------------------------------------------------
+ALTER TABLE test_bldgs_hprofile
+ADD COLUMN hprofile_id SERIAL PRIMARY KEY;
+-------------------------------------------------------------------------------------------
+CREATE INDEX idx_test_bldgs_hprofile_geom
+ON test_bldgs_hprofile
+USING GIST(horiz_line);
+-------------------------------------------------------------------------------------------
+ALTER TABLE test_bldgs 
+ADD COLUMN roof_center geometry(Point,4326);
+-------------------------------------------------------------------------------------------
+UPDATE test_bldgs 
+SET roof_center = ST_Transform(ST_PointOnSurface(geom),4326);
+-------------------------------------------------------------------------------------------
+DROP TABLE IF EXISTS intersect_points;
+COMMIT;
+
+CREATE TABLE intersect_points AS
+SELECT
+  s.id AS source_building_id,
+  h.horiz_azimuth_degree,
+  COALESCE(b.id, '0') AS blocking_building_id,
+  ST_StartPoint(
+    CASE 
+      WHEN b.id IS NOT NULL THEN ST_Intersection(h.horiz_line, b.geom_4326)
+      ELSE NULL
+    END
+  )::geometry(Point,4326) AS intersection_point
+FROM test_bldgs_hprofile h
+JOIN test_bldgs s
+  ON s.id = h.building_id
+LEFT JOIN test_bldgs b
+  ON b.id <> s.id
+     AND b.absolute_top > s.absolute_top
+     AND ST_Intersects(h.horiz_line, b.geom_4326)
+ORDER BY s.id, h.horiz_azimuth_degree;
+COMMIT;
+-------------------------------------------------------------------------------------------
+DROP TABLE IF EXISTS distance_data;
+COMMIT;
+
+CREATE TABLE distance_data AS
+WITH joined AS (
+  SELECT
+    i.source_building_id,
+    i.horiz_azimuth_degree,
+    i.blocking_building_id,
+    i.intersection_point,
+    s.absolute_top AS s_abs,
+    b.absolute_top AS b_abs,
+    s.roof_center  AS s_roof
+  FROM intersect_points i
+  JOIN test_bldgs s 
+    ON s.id = i.source_building_id
+  LEFT JOIN test_bldgs b
+    ON b.id = i.blocking_building_id
+)
+SELECT
+  source_building_id         AS studied_blgd_id,
+  horiz_azimuth_degree       AS studied_horiz_azimuth_degree,
+  blocking_building_id       AS intersected_bldg_id,
+  CASE 
+    WHEN b_abs IS NOT NULL THEN (b_abs - s_abs)
+    ELSE 0
+  END AS delta_height,
+  CASE 
+    WHEN intersection_point IS NOT NULL THEN
+       ST_Distance(
+         ST_Transform(s_roof, 3857),
+         ST_Transform(intersection_point, 3857)
+       ) * COSD(ST_Y(s_roof))
+    ELSE 0
+  END AS distance,
+  CASE 
+    WHEN intersection_point IS NOT NULL AND b_abs IS NOT NULL THEN
+         LEAST(
+           ABS(horiz_azimuth_degree - DEGREES(ST_Azimuth(s_roof, intersection_point))),
+           360 - ABS(horiz_azimuth_degree - DEGREES(ST_Azimuth(s_roof, intersection_point)))
+         )
+    ELSE 0
+  END AS intersected_angle
+FROM joined
+ORDER BY studied_blgd_id, horiz_azimuth_degree;
+COMMIT;
+-------------------------------------------------------------------------------------------
+DROP TABLE IF EXISTS blocking_angle_data;
+COMMIT;
+
+CREATE TABLE blocking_angle_data AS
+SELECT
+  d.studied_blgd_id,
+  d.studied_horiz_azimuth_degree,
+  d.intersected_bldg_id,
+  CASE 
+    WHEN blk.absolute_top IS NOT NULL THEN (blk.absolute_top - src.absolute_top)
+    ELSE 0
+  END AS delta_height,
+  d.distance,
+  CASE 
+    WHEN d.distance IS NOT NULL AND blk.absolute_top IS NOT NULL THEN 
+         ROUND(
+           DEGREES(
+             ATAN2((blk.absolute_top - src.absolute_top), d.distance)
+           )::numeric,
+           2
+         )
+    ELSE 0
+  END AS blocking_angle
+FROM distance_data d
+INNER JOIN test_bldgs src
+  ON d.studied_blgd_id = src.id
+LEFT JOIN test_bldgs blk
+  ON d.intersected_bldg_id = blk.id
+ORDER BY d.studied_blgd_id, d.studied_horiz_azimuth_degree;
+COMMIT;
+-------------------------------------------------------------------------------------------
+DROP TABLE IF EXISTS avg_blocking_angle_data;
+COMMIT;
+
+CREATE TABLE avg_blocking_angle_data AS
+SELECT
+  studied_blgd_id,
+  COALESCE(intersected_bldg_id, '0') AS intersected_bldg_id,
+  COALESCE(ROUND(AVG(blocking_angle)::numeric, 3), 0) AS avg_blocking_angle,
+  COALESCE(ROUND(AVG(distance)::numeric, 3), 0) AS avg_distance
+FROM blocking_angle_data
+GROUP BY studied_blgd_id, COALESCE(intersected_bldg_id, '0')
+ORDER BY studied_blgd_id, COALESCE(intersected_bldg_id, '0');
+COMMIT;
+-------------------------------------------------------------------------------------------
+DROP TABLE IF EXISTS eligible_candidates;
+COMMIT;
+
+CREATE TABLE eligible_candidates AS
+WITH summed AS (
+  SELECT 
+    studied_blgd_id,
+    ROUND(SUM(avg_blocking_angle)::numeric, 3) AS sum_avg_blocking_angle
+  FROM avg_blocking_angle_data
+  GROUP BY studied_blgd_id
+  HAVING SUM(avg_blocking_angle) <= 10
+)
+SELECT 
+  s.studied_blgd_id,
+  s.sum_avg_blocking_angle,
+  b.roof_center AS geom
+FROM summed s
+JOIN test_bldgs b
+  ON s.studied_blgd_id = b.id
+ORDER BY s.studied_blgd_id;
+COMMIT;
+------------------------------------------------------------------------------------------
